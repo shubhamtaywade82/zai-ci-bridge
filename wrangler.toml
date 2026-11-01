@@ -10,5 +10,3 @@ NON_DEFAULT_PR_TARGET_MODE="original_base"
 MAX_BOT_COMMITS_PER_BRANCH="5"
 MAX_DIAGNOSTIC_TARGETS="50"
 
-[limits]
-subrequests = 1000
