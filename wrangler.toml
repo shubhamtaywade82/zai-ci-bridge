@@ -1,0 +1,19 @@
+name = "zai-ci-bridge"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[vars]
+# Comma-separated owner/repository names. Keep empty until the monitored repos are selected.
+# Example: "shubhamtaywade82/ollama-sdk,shubhamtaywade82/ollama-client"
+ALLOWED_REPOS = ""
+
+# original_base -> open the fix PR against the source PR's original base (or default branch).
+# broken_branch -> open the fix PR against the broken source branch itself.
+NON_DEFAULT_PR_TARGET_MODE = "original_base"
+
+# Stop adding automated commits after this many consecutive [autofix] commits on a fix branch.
+MAX_BOT_COMMITS_PER_BRANCH = "5"
+
+# Upper bound on default/open-PR branches inspected per repository.
+MAX_DIAGNOSTIC_TARGETS = "50"
