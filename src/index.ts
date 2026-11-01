@@ -7,8 +7,54 @@ const MAX_LOG_TAIL_CHARS = 24_000;
 const MAX_LOG_TEXT_BYTES = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC_TARGETS = 50;
 
+export interface Env {
+  GITHUB_TOKEN?: string;
+  CAPABILITY_SECRET?: string;
+  ALLOWED_REPOS?: string;
+  NON_DEFAULT_PR_TARGET_MODE?: string;
+  MAX_BOT_COMMITS_PER_BRANCH?: string;
+  MAX_DIAGNOSTIC_TARGETS?: string;
+}
+
+export interface AppConfig {
+  allowedRepos: string[] | "*";
+  prTargetMode: "original_base" | "broken_branch";
+  maxBotCommits: number;
+  maxTargets: number;
+}
+
+export interface ValidatedFixFile {
+  path: string;
+  content?: string;
+  deleted: boolean;
+}
+
+export interface WorkflowRun {
+  id: number | string;
+  workflow_id?: number | string;
+  name?: string;
+  display_title?: string;
+  status?: string;
+  conclusion?: string;
+  created_at?: string;
+  run_started_at?: string;
+  run_attempt?: number;
+  html_url?: string;
+  [key: string]: unknown;
+}
+
+export interface DiagnosticTarget {
+  branch: string;
+  headSha: string;
+  isDefaultBranch: boolean;
+  isAutofixBranch: boolean;
+  prNumber: number | null;
+  baseBranch: string;
+}
+
 class HttpError extends Error {
-  constructor(status, message) {
+  status: number;
+  constructor(status: number, message: string) {
     super(message);
     this.name = "HttpError";
     this.status = status;
@@ -16,7 +62,8 @@ class HttpError extends Error {
 }
 
 class GitHubApiError extends Error {
-  constructor(status, message) {
+  status: number;
+  constructor(status: number, message: string) {
     super(message);
     this.name = "GitHubApiError";
     this.status = status;
@@ -24,7 +71,7 @@ class GitHubApiError extends Error {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const route = authorizeAndResolveRoute(request, url, env.CAPABILITY_SECRET);
     if (!route) return jsonResponse({ error: "Forbidden" }, 403);
@@ -33,14 +80,14 @@ export default {
       return jsonResponse({ error: "Server misconfigured: missing GITHUB_TOKEN secret" }, 503);
     }
 
-    let config;
+    let config: AppConfig;
     try {
       config = loadConfig(env);
     } catch (error) {
-      return jsonResponse({ error: `Invalid Worker configuration: ${error.message}` }, 500);
+      return jsonResponse({ error: `Invalid Worker configuration: ${safeErrorMessage(error)}` }, 500);
     }
 
-    const ghHeaders = {
+    const ghHeaders: Record<string, string> = {
       Authorization: `Bearer ${env.GITHUB_TOKEN}`,
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
@@ -49,19 +96,16 @@ export default {
 
     try {
       if (request.method === "GET" && route.action === "health") {
-        return await healthCheck(config, ghHeaders);
+        return await healthCheck(url, config, ghHeaders);
       }
-
       if (request.method === "GET" && route.action === "diagnostics") {
         return await handleDiagnostics(url, config, ghHeaders);
       }
-
       if (request.method === "POST" && route.action === "apply-fix") {
         const body = await readJsonBody(request);
         const result = await applyFix(body, config, ghHeaders);
         return jsonResponse(result);
       }
-
       return jsonResponse({ error: "Route not found" }, 404);
     } catch (error) {
       const status = error instanceof HttpError
@@ -74,10 +118,10 @@ export default {
   }
 };
 
-export function loadConfig(env) {
+export function loadConfig(env: Env): AppConfig {
   const allowedRepos = parseAllowedRepos(env.ALLOWED_REPOS || "");
   const prTargetMode = env.NON_DEFAULT_PR_TARGET_MODE || "original_base";
-  if (!["original_base", "broken_branch"].includes(prTargetMode)) {
+  if (prTargetMode !== "original_base" && prTargetMode !== "broken_branch") {
     throw new Error("NON_DEFAULT_PR_TARGET_MODE must be original_base or broken_branch");
   }
 
@@ -89,7 +133,7 @@ export function loadConfig(env) {
   return { allowedRepos, prTargetMode, maxBotCommits, maxTargets };
 }
 
-export function isValidRepoName(repo) {
+export function isValidRepoName(repo: unknown): boolean {
   if (typeof repo !== "string") return false;
   const [owner, name] = repo.split("/");
   return (
@@ -103,7 +147,7 @@ export function isValidRepoName(repo) {
   );
 }
 
-export function parseAllowedRepos(value) {
+export function parseAllowedRepos(value: unknown): string[] | "*" {
   const normalized = String(value).trim();
   if (normalized === "*") return "*";
 
@@ -116,12 +160,12 @@ export function parseAllowedRepos(value) {
   return repos;
 }
 
-export function isRepoAllowed(repo, allowedRepos) {
+export function isRepoAllowed(repo: unknown, allowedRepos: string[] | "*"): boolean {
   if (!isValidRepoName(repo)) return false;
-  return allowedRepos === "*" || (Array.isArray(allowedRepos) && allowedRepos.includes(repo));
+  return allowedRepos === "*" || (Array.isArray(allowedRepos) && allowedRepos.includes(repo as string));
 }
 
-export function validateFixFiles(files) {
+export function validateFixFiles(files: unknown): ValidatedFixFile[] {
   if (!Array.isArray(files) || files.length === 0) {
     throw new HttpError(400, "files must be a non-empty array");
   }
@@ -129,31 +173,32 @@ export function validateFixFiles(files) {
     throw new HttpError(413, `A fix may change at most ${MAX_FILES_PER_FIX} files`);
   }
 
-  const seenPaths = new Set();
+  const seenPaths = new Set<string>();
   return files.map((file, index) => {
     if (!file || typeof file !== "object" || Array.isArray(file)) {
       throw new HttpError(400, `files[${index}] must be an object`);
     }
-    const path = file.path;
+    const rec = file as Record<string, unknown>;
+    const path = rec.path;
     if (typeof path !== "string" || path.length === 0 || path.length > 1024 || !isSafeRepositoryPath(path)) {
       throw new HttpError(403, `Path blocked by policy: ${String(path ?? "")}`);
     }
     if (seenPaths.has(path)) throw new HttpError(400, `Duplicate file path: ${path}`);
     seenPaths.add(path);
 
-    if (file.deleted === true) return { path, deleted: true };
-    if (typeof file.content !== "string") {
+    if (rec.deleted === true) return { path, deleted: true };
+    if (typeof rec.content !== "string") {
       throw new HttpError(400, `files[${index}].content must be a string unless deleted is true`);
     }
-    const byteLength = new TextEncoder().encode(file.content).byteLength;
+    const byteLength = new TextEncoder().encode(rec.content).byteLength;
     if (byteLength > MAX_FILE_BYTES) {
       throw new HttpError(413, `File exceeds ${MAX_FILE_BYTES} bytes: ${path}`);
     }
-    return { path, content: file.content, deleted: false };
+    return { path, content: rec.content, deleted: false };
   });
 }
 
-export function isSafeRepositoryPath(path) {
+export function isSafeRepositoryPath(path: unknown): boolean {
   if (typeof path !== "string" || path.length === 0) return false;
   if (path.startsWith("/") || path.includes("\\") || path.includes("\0") || path.includes("//")) return false;
   const segments = path.split("/");
@@ -162,7 +207,7 @@ export function isSafeRepositoryPath(path) {
   return true;
 }
 
-export function normalizeFixBranch(sourceBranch) {
+export function normalizeFixBranch(sourceBranch: unknown): string {
   if (typeof sourceBranch !== "string" || sourceBranch.length === 0 || sourceBranch.length > 240) {
     throw new HttpError(400, "sourceBranch must be a non-empty branch name no longer than 240 characters");
   }
@@ -171,8 +216,12 @@ export function normalizeFixBranch(sourceBranch) {
   return `autofix/${safeSuffix}`;
 }
 
-export function classifyWorkflowRuns(runs) {
-  const latestByWorkflow = new Map();
+export function classifyWorkflowRuns(runs: WorkflowRun[]): {
+  state: "in_progress" | "failure" | "success" | "inconclusive";
+  latestRuns: WorkflowRun[];
+  failedRuns?: WorkflowRun[];
+} {
+  const latestByWorkflow = new Map<string, WorkflowRun>();
   for (const run of runs) {
     const key = String(run.workflow_id ?? run.name ?? run.id);
     const current = latestByWorkflow.get(key);
@@ -186,10 +235,10 @@ export function classifyWorkflowRuns(runs) {
   }
 
   const latestRuns = [...latestByWorkflow.values()];
-  if (latestRuns.some(run => ["queued", "in_progress", "requested", "waiting", "pending"].includes(run.status))) {
+  if (latestRuns.some(run => ["queued", "in_progress", "requested", "waiting", "pending"].includes(run.status || ""))) {
     return { state: "in_progress", latestRuns };
   }
-  const failedRuns = latestRuns.filter(run => ["failure", "timed_out", "action_required"].includes(run.conclusion));
+  const failedRuns = latestRuns.filter(run => ["failure", "timed_out", "action_required"].includes(run.conclusion || ""));
   if (failedRuns.length > 0) return { state: "failure", latestRuns, failedRuns };
   if (latestRuns.length > 0 && latestRuns.every(run => run.conclusion === "success")) {
     return { state: "success", latestRuns };
@@ -197,7 +246,7 @@ export function classifyWorkflowRuns(runs) {
   return { state: "inconclusive", latestRuns };
 }
 
-export async function extractLogTail(zipBytes, maxChars = MAX_LOG_TAIL_CHARS) {
+export async function extractLogTail(zipBytes: ArrayBuffer | Uint8Array, maxChars = MAX_LOG_TAIL_CHARS): Promise<string> {
   const bytes = zipBytes instanceof Uint8Array ? zipBytes : new Uint8Array(zipBytes);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const endRecordOffset = findZipEndRecord(bytes);
@@ -211,7 +260,7 @@ export async function extractLogTail(zipBytes, maxChars = MAX_LOG_TAIL_CHARS) {
 
   let cursor = centralDirectoryOffset;
   let totalUncompressedBytes = 0;
-  const textFiles = [];
+  const textFiles: [string, string][] = [];
   for (let index = 0; index < entryCount; index += 1) {
     if (view.getUint32(cursor, true) !== 0x02014b50) throw new Error("Invalid ZIP central directory entry");
     const flags = view.getUint16(cursor + 8, true);
@@ -239,7 +288,7 @@ export async function extractLogTail(zipBytes, maxChars = MAX_LOG_TAIL_CHARS) {
     const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
     if (compressed.byteLength !== compressedSize) throw new Error("Truncated ZIP log entry");
 
-    let content;
+    let content: Uint8Array;
     if (compressionMethod === 0) {
       content = compressed;
     } else if (compressionMethod === 8) {
@@ -257,10 +306,10 @@ export async function extractLogTail(zipBytes, maxChars = MAX_LOG_TAIL_CHARS) {
   return output.slice(-maxChars);
 }
 
-async function inflateRawBounded(compressed, maxOutputBytes) {
-  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressStream("deflate-raw"));
+async function inflateRawBounded(compressed: Uint8Array, maxOutputBytes: number): Promise<Uint8Array> {
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
   const reader = stream.getReader();
-  const chunks = [];
+  const chunks: Uint8Array[] = [];
   let totalBytes = 0;
   try {
     while (true) {
@@ -285,7 +334,7 @@ async function inflateRawBounded(compressed, maxOutputBytes) {
   return output;
 }
 
-function findZipEndRecord(bytes) {
+function findZipEndRecord(bytes: Uint8Array): number {
   const minimumOffset = Math.max(0, bytes.byteLength - 65_557);
   for (let offset = bytes.byteLength - 22; offset >= minimumOffset; offset -= 1) {
     if (bytes[offset] === 0x50 && bytes[offset + 1] === 0x4b &&
@@ -294,7 +343,7 @@ function findZipEndRecord(bytes) {
   return -1;
 }
 
-function authorizeAndResolveRoute(request, url, capabilitySecret) {
+function authorizeAndResolveRoute(request: Request, url: URL, capabilitySecret?: string): { action: string } | null {
   if (!capabilitySecret || typeof capabilitySecret !== "string") return null;
   const segments = url.pathname.split("/").filter(Boolean);
   const bearer = request.headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] || "";
@@ -306,7 +355,7 @@ function authorizeAndResolveRoute(request, url, capabilitySecret) {
   return { action };
 }
 
-function constantTimeEqual(left, right) {
+function constantTimeEqual(left: string, right: string): boolean {
   if (typeof left !== "string" || typeof right !== "string") return false;
   const encoder = new TextEncoder();
   const a = encoder.encode(left);
@@ -319,7 +368,7 @@ function constantTimeEqual(left, right) {
   return difference === 0;
 }
 
-function parseIntegerInRange(value, min, max, name) {
+function parseIntegerInRange(value: unknown, min: number, max: number, name: string): number {
   if (!/^\d+$/.test(String(value))) throw new Error(`${name} must be an integer between ${min} and ${max}`);
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
@@ -328,7 +377,7 @@ function parseIntegerInRange(value, min, max, name) {
   return parsed;
 }
 
-async function readJsonBody(request) {
+async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
   const contentLength = Number(request.headers.get("content-length") || 0);
   if (contentLength > MAX_REQUEST_BYTES) throw new HttpError(413, "Request body exceeds 1 MiB");
   const text = await readRequestText(request, MAX_REQUEST_BYTES);
@@ -339,10 +388,10 @@ async function readJsonBody(request) {
   }
 }
 
-async function readRequestText(request, maxBytes) {
+async function readRequestText(request: Request, maxBytes: number): Promise<string> {
   if (!request.body) return "";
   const reader = request.body.getReader();
-  const chunks = [];
+  const chunks: Uint8Array[] = [];
   let totalBytes = 0;
   try {
     while (true) {
@@ -361,28 +410,29 @@ async function readRequestText(request, maxBytes) {
   const bytes = new Uint8Array(totalBytes);
   let offset = 0;
   for (const chunk of chunks) {
-    bytes.set(chunk, offset);
+    outputBytes(bytes, chunk, offset);
     offset += chunk.byteLength;
   }
   return new TextDecoder().decode(bytes);
 }
 
-async function handleDiagnostics(url, config, ghHeaders) {
+function outputBytes(target: Uint8Array, source: Uint8Array, offset: number): void {
+  target.set(source, offset);
+}
+
+async function handleDiagnostics(url: URL, config: AppConfig, ghHeaders: Record<string, string>): Promise<Response> {
   const requestedRepo = url.searchParams.get("repo");
   if (requestedRepo && !isRepoAllowed(requestedRepo, config.allowedRepos)) {
     throw new HttpError(400, "Repository not in ALLOWED_REPOS");
   }
 
-  const repos = requestedRepo
-    ? [requestedRepo]
-    : (config.allowedRepos === "*"
-        ? await discoverAccessibleRepos(ghHeaders)
-        : config.allowedRepos);
+  if (!requestedRepo && config.allowedRepos === "*") {
+    throw new HttpError(400, "In wildcard mode, specify ?repo=owner/repo to diagnose a repository within subrequest limits");
+  }
 
+  const repos = requestedRepo ? [requestedRepo] : config.allowedRepos;
   if (repos.length === 0) {
-    throw new HttpError(400, config.allowedRepos === "*"
-      ? "No accessible repositories found for GitHub token"
-      : "ALLOWED_REPOS is empty; configure at least one repository");
+    throw new HttpError(400, "ALLOWED_REPOS is empty; configure at least one repository");
   }
 
   const reports = [];
@@ -393,18 +443,38 @@ async function handleDiagnostics(url, config, ghHeaders) {
   return jsonResponse({ timestamp: new Date().toISOString(), reports });
 }
 
-export async function discoverAccessibleRepos(headers, maxRepos = 100, pageSize = Math.min(100, maxRepos)) {
-  const repos = [];
+export interface DiscoveredRepo {
+  fullName: string;
+  defaultBranch: string;
+  pushPermission: boolean | null;
+}
+
+export async function discoverAccessibleRepoObjects(
+  headers: Record<string, string>,
+  maxRepos = 100,
+  pageSize = Math.min(100, maxRepos)
+): Promise<DiscoveredRepo[]> {
+  const repos: DiscoveredRepo[] = [];
   let page = 1;
   while (repos.length < maxRepos) {
-    const data = await ghFetch(
+    const data = await ghFetch<Array<{
+      full_name?: string;
+      default_branch?: string;
+      permissions?: { push?: boolean };
+      archived?: boolean;
+      disabled?: boolean;
+    }>>(
       `${GITHUB_API}/user/repos?per_page=${pageSize}&page=${page}&sort=updated`,
       headers
     );
     if (!Array.isArray(data) || data.length === 0) break;
     for (const item of data) {
       if (item.full_name && !item.archived && !item.disabled) {
-        repos.push(item.full_name);
+        repos.push({
+          fullName: item.full_name,
+          defaultBranch: item.default_branch || "main",
+          pushPermission: item.permissions?.push ?? null
+        });
         if (repos.length >= maxRepos) break;
       }
     }
@@ -414,15 +484,40 @@ export async function discoverAccessibleRepos(headers, maxRepos = 100, pageSize 
   return repos;
 }
 
-async function healthCheck(config, headers) {
-  const [user, rateLimit] = await fetchGitHubIdentity(headers);
-  const targetRepos = config.allowedRepos === "*"
-    ? await discoverAccessibleRepos(headers)
-    : config.allowedRepos;
+export async function discoverAccessibleRepos(
+  headers: Record<string, string>,
+  maxRepos = 100,
+  pageSize = Math.min(100, maxRepos)
+): Promise<string[]> {
+  const objects = await discoverAccessibleRepoObjects(headers, maxRepos, pageSize);
+  return objects.map(r => r.fullName);
+}
 
-  const repositoryReports = [];
-  for (const repo of targetRepos) {
-    repositoryReports.push(await checkRepositoryAccess(repo, headers));
+async function healthCheck(url: URL, config: AppConfig, headers: Record<string, string>): Promise<Response> {
+  const [user, rateLimit] = await fetchGitHubIdentity(headers);
+  const requestedRepo = url.searchParams.get("repo");
+  if (requestedRepo && !isRepoAllowed(requestedRepo, config.allowedRepos)) {
+    throw new HttpError(400, "Repository not in ALLOWED_REPOS");
+  }
+
+  let repositoryReports: Array<Record<string, unknown>> = [];
+  let discoveredRepoNames: string[] | undefined;
+
+  if (requestedRepo) {
+    repositoryReports = [await checkRepositoryAccessDeep(requestedRepo, headers)];
+  } else if (config.allowedRepos === "*") {
+    const discovered = await discoverAccessibleRepoObjects(headers);
+    discoveredRepoNames = discovered.map(r => r.fullName);
+    repositoryReports = discovered.map(r => ({
+      repo: r.fullName,
+      status: "ok",
+      defaultBranch: r.defaultBranch,
+      accountPushPermission: r.pushPermission
+    }));
+  } else {
+    for (const repo of config.allowedRepos) {
+      repositoryReports.push(await checkRepositoryAccess(repo, headers));
+    }
   }
 
   const repositoriesHealthy = repositoryReports.every(report => report.status === "ok");
@@ -431,44 +526,68 @@ async function healthCheck(config, headers) {
     githubAuthentication: "ok",
     githubUser: user.login,
     allowedRepos: config.allowedRepos,
-    discoveredRepos: config.allowedRepos === "*" ? targetRepos : undefined,
+    discoveredRepos: discoveredRepoNames,
     repositoryAccess: repositoryReports,
     prTargetMode: config.prTargetMode,
     maxBotCommitsPerBranch: config.maxBotCommits,
     githubRateLimitRemaining: rateLimit.rate?.remaining ?? null,
-    warning: healthCheckWarning(config.allowedRepos, targetRepos)
+    warning: healthCheckWarning(config.allowedRepos, repositoryReports.length)
   }, repositoriesHealthy ? 200 : 207);
 }
 
-async function fetchGitHubIdentity(headers) {
+async function fetchGitHubIdentity(headers: Record<string, string>): Promise<[{ login: string }, { rate?: { remaining: number } }]> {
   try {
     return await Promise.all([
-      ghFetch(`${GITHUB_API}/user`, headers),
-      ghFetch(`${GITHUB_API}/rate_limit`, headers)
+      ghFetch<{ login: string }>(`${GITHUB_API}/user`, headers),
+      ghFetch<{ rate?: { remaining: number } }>(`${GITHUB_API}/rate_limit`, headers)
     ]);
   } catch (error) {
     throw new HttpError(502, `GitHub authentication check failed: ${safeErrorMessage(error)}`);
   }
 }
 
-function healthCheckWarning(allowedRepos, targetRepos) {
+function healthCheckWarning(allowedRepos: string[] | "*", reportsCount: number): string {
   if (allowedRepos !== "*" && allowedRepos.length === 0) {
     return "ALLOWED_REPOS is empty; diagnostics and apply-fix are disabled until it is configured.";
   }
-  if (allowedRepos === "*" && targetRepos.length === 0) {
+  if (allowedRepos === "*" && reportsCount === 0) {
     return "No accessible repositories found for the GitHub token.";
   }
   return "Push permission is reported for the linked GitHub user; GitHub does not expose fine-grained token write grants through this read-only health check.";
 }
 
-async function checkRepositoryAccess(repo, headers) {
+async function checkRepositoryAccess(repo: string, headers: Record<string, string>): Promise<Record<string, unknown>> {
   const encoded = encodeRepo(repo);
   try {
-    const metadata = await ghFetch(`${GITHUB_API}/repos/${encoded}`, headers);
+    const metadata = await ghFetch<{ default_branch: string; permissions?: { push?: boolean } }>(
+      `${GITHUB_API}/repos/${encoded}`,
+      headers
+    );
+    return {
+      repo,
+      status: "ok",
+      accountPushPermission: metadata.permissions?.push ?? null,
+      defaultBranch: metadata.default_branch
+    };
+  } catch (error) {
+    return { repo, status: "error", error: safeErrorMessage(error) };
+  }
+}
+
+async function checkRepositoryAccessDeep(repo: string, headers: Record<string, string>): Promise<Record<string, unknown>> {
+  const encoded = encodeRepo(repo);
+  try {
+    const metadata = await ghFetch<{ default_branch: string; permissions?: { push?: boolean } }>(
+      `${GITHUB_API}/repos/${encoded}`,
+      headers
+    );
     const [contents, actions, pullRequests] = await Promise.all([
-      ghFetch(`${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(metadata.default_branch)}`, headers),
-      ghFetch(`${GITHUB_API}/repos/${encoded}/actions/runs?per_page=1`, headers),
-      ghFetch(`${GITHUB_API}/repos/${encoded}/pulls?state=open&per_page=1`, headers)
+      ghFetch<{ object?: { sha?: string } }>(
+        `${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(metadata.default_branch)}`,
+        headers
+      ),
+      ghFetch<{ total_count?: number }>(`${GITHUB_API}/repos/${encoded}/actions/runs?per_page=1`, headers),
+      ghFetch<unknown[]>(`${GITHUB_API}/repos/${encoded}/pulls?state=open&per_page=1`, headers)
     ]);
     return {
       repo,
@@ -486,15 +605,21 @@ async function checkRepositoryAccess(repo, headers) {
   }
 }
 
-async function inspectRepository(repo, headers, config) {
+async function inspectRepository(repo: string, headers: Record<string, string>, config: AppConfig): Promise<Record<string, unknown>> {
   const encoded = encodeRepo(repo);
   const [repoData, openPRs] = await Promise.all([
-    ghFetch(`${GITHUB_API}/repos/${encoded}`, headers),
-    ghFetch(`${GITHUB_API}/repos/${encoded}/pulls?state=open&per_page=100`, headers)
+    ghFetch<{ default_branch: string }>(`${GITHUB_API}/repos/${encoded}`, headers),
+    ghFetch<Array<{ number: number; head: { repo?: { full_name?: string }; ref?: string; sha?: string }; base: { ref: string } }>>(
+      `${GITHUB_API}/repos/${encoded}/pulls?state=open&per_page=100`,
+      headers
+    )
   ]);
   const defaultBranch = repoData.default_branch;
-  const targetsByBranch = new Map();
-  const defaultRef = await ghFetch(`${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(defaultBranch)}`, headers);
+  const targetsByBranch = new Map<string, DiagnosticTarget>();
+  const defaultRef = await ghFetch<{ object: { sha: string } }>(
+    `${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(defaultBranch)}`,
+    headers
+  );
   targetsByBranch.set(defaultBranch, {
     branch: defaultBranch,
     headSha: defaultRef.object.sha,
@@ -527,7 +652,7 @@ async function inspectRepository(repo, headers, config) {
     const existingAutofixPR = !target.isAutofixBranch
       ? openPRs.find(pr => pr.head.repo?.full_name === repo && pr.head.ref === expectedFixBranch) || null
       : null;
-    const runsResponse = await ghFetch(
+    const runsResponse = await ghFetch<{ workflow_runs?: WorkflowRun[] }>(
       `${GITHUB_API}/repos/${encoded}/actions/runs?head_sha=${encodeURIComponent(target.headSha)}&per_page=100`,
       headers
     );
@@ -553,12 +678,12 @@ async function inspectRepository(repo, headers, config) {
     }
     if (existingAutofixPR) continue;
 
-    const primaryFailedRun = classification.failedRuns[0];
-    const jobsResponse = await ghFetch(
+    const primaryFailedRun = classification.failedRuns![0];
+    const jobsResponse = await ghFetch<{ jobs?: Array<{ id: number; name?: string; conclusion?: string; steps?: Array<{ name: string; conclusion?: string }> }> }>(
       `${GITHUB_API}/repos/${encoded}/actions/runs/${primaryFailedRun.id}/jobs?per_page=100`,
       headers
     );
-    const failedJob = (jobsResponse.jobs || []).find(job => ["failure", "timed_out", "action_required"].includes(job.conclusion));
+    const failedJob = (jobsResponse.jobs || []).find(job => ["failure", "timed_out", "action_required"].includes(job.conclusion || ""));
     const logTail = failedJob
       ? await fetchJobLogTail(repo, failedJob.id, headers)
       : "No failed job details available.";
@@ -590,7 +715,7 @@ async function inspectRepository(repo, headers, config) {
   };
 }
 
-async function fetchJobLogTail(repo, jobId, headers) {
+async function fetchJobLogTail(repo: string, jobId: number, headers: Record<string, string>): Promise<string> {
   const encoded = encodeRepo(repo);
   try {
     const response = await fetch(`${GITHUB_API}/repos/${encoded}/actions/jobs/${jobId}/logs`, {
@@ -606,13 +731,12 @@ async function fetchJobLogTail(repo, jobId, headers) {
   }
 }
 
-
-async function readResponseBytes(response, maxBytes) {
+async function readResponseBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
   const announcedLength = Number(response.headers.get("content-length") || 0);
   if (announcedLength > maxBytes) throw new Error(`GitHub log archive exceeded the ${maxBytes}-byte download limit`);
   if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
-  const chunks = [];
+  const chunks: Uint8Array[] = [];
   let totalBytes = 0;
   try {
     while (true) {
@@ -631,13 +755,13 @@ async function readResponseBytes(response, maxBytes) {
   const output = new Uint8Array(totalBytes);
   let offset = 0;
   for (const chunk of chunks) {
-    output.set(chunk, offset);
+    outputBytes(output, chunk, offset);
     offset += chunk.byteLength;
   }
   return output;
 }
 
-async function applyFix(body, config, headers) {
+async function applyFix(body: Record<string, unknown>, config: AppConfig, headers: Record<string, string>): Promise<Record<string, unknown>> {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "Request body must be a JSON object");
   }
@@ -653,24 +777,25 @@ async function applyFix(body, config, headers) {
     throw new HttpError(400, "commitMessage must be a string no longer than 200 characters");
   }
 
+  const repoName = repo as string;
   const fixBranch = normalizeFixBranch(sourceBranch);
-  const encoded = encodeRepo(repo);
-  const repoData = await ghFetch(`${GITHUB_API}/repos/${encoded}`, headers);
+  const encoded = encodeRepo(repoName);
+  const repoData = await ghFetch<{ default_branch: string }>(`${GITHUB_API}/repos/${encoded}`, headers);
   const defaultBranch = repoData.default_branch;
-  const sourceRef = await ghFetch(
+  const sourceRef = await ghFetch<{ object: { sha: string } }>(
     `${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(sourceBranch)}`,
     headers
   );
   let parentCommitSha = sourceRef.object.sha;
 
-  const existingRef = await ghFetchOptional(
+  const existingRef = await ghFetchOptional<{ object: { sha: string } }>(
     `${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(fixBranch)}`,
     headers
   );
   const fixBranchExists = Boolean(existingRef);
   if (existingRef) {
     parentCommitSha = existingRef.object.sha;
-    const recentCommits = await ghFetch(
+    const recentCommits = await ghFetch<Array<{ commit?: { message?: string } }>>(
       `${GITHUB_API}/repos/${encoded}/commits?sha=${encodeURIComponent(fixBranch)}&per_page=${config.maxBotCommits}`,
       headers
     );
@@ -681,18 +806,18 @@ async function applyFix(body, config, headers) {
     }
   }
 
-  const existingPRs = await ghFetch(
-    `${GITHUB_API}/repos/${encoded}/pulls?state=open&head=${encodeURIComponent(`${repo.split("/")[0]}:${fixBranch}`)}&per_page=100`,
+  const existingPRs = await ghFetch<Array<{ html_url: string; base: { ref: string } }>>(
+    `${GITHUB_API}/repos/${encoded}/pulls?state=open&head=${encodeURIComponent(`${repoName.split("/")[0]}:${fixBranch}`)}&per_page=100`,
     headers
   );
-  let prUrl = existingPRs[0]?.html_url || null;
-  let prBase = existingPRs[0]?.base?.ref || null;
+  let prUrl: string | null = existingPRs[0]?.html_url || null;
+  let prBase: string | null = existingPRs[0]?.base?.ref || null;
 
   if (!prUrl) {
     if (sourceBranch === defaultBranch) {
       prBase = defaultBranch;
     } else if (config.prTargetMode === "original_base") {
-      prBase = originalBaseBranch || defaultBranch;
+      prBase = (typeof originalBaseBranch === "string" && originalBaseBranch) ? originalBaseBranch : defaultBranch;
     } else {
       prBase = sourceBranch;
     }
@@ -706,22 +831,25 @@ async function applyFix(body, config, headers) {
     if (prBase === fixBranch) throw new HttpError(400, "Pull request base cannot equal the autofix branch");
   }
 
-  const baseCommit = await ghFetch(`${GITHUB_API}/repos/${encoded}/git/commits/${parentCommitSha}`, headers);
+  const baseCommit = await ghFetch<{ tree: { sha: string } }>(
+    `${GITHUB_API}/repos/${encoded}/git/commits/${parentCommitSha}`,
+    headers
+  );
   const treeItems = files.map(file => file.deleted
     ? { path: file.path, sha: null }
     : { path: file.path, mode: "100644", type: "blob", content: file.content });
-  const newTree = await ghFetch(`${GITHUB_API}/repos/${encoded}/git/trees`, headers, "POST", {
+  const newTree = await ghFetch<{ sha: string }>(`${GITHUB_API}/repos/${encoded}/git/trees`, headers, "POST", {
     base_tree: baseCommit.tree.sha,
     tree: treeItems
   });
-  const normalizedMessage = (commitMessage || "Resolve pipeline failure")
+  const normalizedMessage = (commitMessage as string || "Resolve pipeline failure")
     .replace(/[\r\n\t]+/g, " ")
     .replace(/[\x00-\x1f\x7f]/g, "")
     .trim() || "Resolve pipeline failure";
   const formattedMessage = normalizedMessage.startsWith("[autofix]")
     ? normalizedMessage
     : `[autofix] ${normalizedMessage}`;
-  const newCommit = await ghFetch(`${GITHUB_API}/repos/${encoded}/git/commits`, headers, "POST", {
+  const newCommit = await ghFetch<{ sha: string }>(`${GITHUB_API}/repos/${encoded}/git/commits`, headers, "POST", {
     message: formattedMessage,
     tree: newTree.sha,
     parents: [parentCommitSha]
@@ -742,7 +870,7 @@ async function applyFix(body, config, headers) {
   }
 
   if (!prUrl) {
-    const createdPR = await ghFetch(`${GITHUB_API}/repos/${encoded}/pulls`, headers, "POST", {
+    const createdPR = await ghFetch<{ html_url: string }>(`${GITHUB_API}/repos/${encoded}/pulls`, headers, "POST", {
       title: `fix(ci): automated pipeline repair for ${sourceBranch}`,
       head: fixBranch,
       base: prBase,
@@ -760,7 +888,7 @@ async function applyFix(body, config, headers) {
 
   return {
     status: "success",
-    repo,
+    repo: repoName,
     sourceBranch,
     fixBranch,
     baseBranch: prBase,
@@ -769,7 +897,7 @@ async function applyFix(body, config, headers) {
   };
 }
 
-function countConsecutiveBotCommits(commits) {
+function countConsecutiveBotCommits(commits: Array<{ commit?: { message?: string } }>): number {
   let count = 0;
   for (const commit of commits) {
     if (!commit.commit?.message?.startsWith("[autofix]")) break;
@@ -778,12 +906,17 @@ function countConsecutiveBotCommits(commits) {
   return count;
 }
 
-function encodeRepo(repo) {
+function encodeRepo(repo: string): string {
   const [owner, name] = repo.split("/");
   return `${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
 }
 
-async function ghFetch(url, headers, method = "GET", body = null) {
+async function ghFetch<T = unknown>(
+  url: string,
+  headers: Record<string, string>,
+  method = "GET",
+  body: unknown = null
+): Promise<T> {
   const response = await fetch(url, {
     method,
     headers: body ? { ...headers, "Content-Type": "application/json" } : headers,
@@ -793,26 +926,26 @@ async function ghFetch(url, headers, method = "GET", body = null) {
     const responseText = (await response.text()).slice(0, 1200);
     throw new GitHubApiError(response.status, `GitHub ${method} ${response.status}: ${responseText}`);
   }
-  return response.json();
+  return (await response.json()) as T;
 }
 
-async function ghFetchOptional(url, headers) {
+async function ghFetchOptional<T = unknown>(url: string, headers: Record<string, string>): Promise<T | null> {
   const response = await fetch(url, { headers });
   if (response.status === 404) return null;
   if (!response.ok) {
     const responseText = (await response.text()).slice(0, 1200);
     throw new GitHubApiError(response.status, `GitHub GET ${response.status}: ${responseText}`);
   }
-  return response.json();
+  return (await response.json()) as T;
 }
 
-function safeErrorMessage(error) {
-  if (error instanceof GitHubApiError) return error.message;
-  if (error instanceof HttpError) return error.message;
-  return error?.message || "Unexpected server error";
+function safeErrorMessage(error: unknown): string {
+  if (error instanceof GitHubApiError || error instanceof HttpError) return error.message;
+  if (error instanceof Error) return error.message;
+  return "Unexpected server error";
 }
 
-function jsonResponse(data, status = 200) {
+function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {

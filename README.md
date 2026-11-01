@@ -9,12 +9,13 @@ zai-ci-bridge/
 ├── .env.example
 ├── .gitignore
 ├── package.json
+├── tsconfig.json
 ├── README.md
 ├── wrangler.toml
 ├── src/
-│   └── index.js
+│   └── index.ts
 └── test/
-    └── index.test.js
+    └── index.test.ts
 ```
 
 ## Configuration
@@ -77,7 +78,7 @@ All endpoints require the capability secret. A bearer header is preferred becaus
 
 ### `GET /health`
 
-Checks GitHub token authentication and reads repository metadata, Actions runs, and pull requests for each allowed repository. It reports account-level push permission where GitHub exposes it; it cannot prove the token's fine-grained Contents write grant without performing a real write.
+Checks GitHub token authentication and lists accessible repositories. In wildcard mode, accessible active repositories are batched in a single GitHub API call to stay strictly within Cloudflare subrequest limits. An optional `?repo=owner/repo` query parameter runs a deep check (git ref, workflow runs, and pull requests) for that specific repository.
 
 ```bash
 curl -sS -H "Authorization: Bearer $CAPABILITY_SECRET" \
@@ -86,7 +87,7 @@ curl -sS -H "Authorization: Bearer $CAPABILITY_SECRET" \
 
 ### `GET /diagnostics`
 
-Scans each allowlisted repository's default branch and open pull-request branches, then classifies the latest run per workflow for each exact head SHA. Failed job logs are downloaded as GitHub ZIP archives, decoded, and truncated to a bounded tail.
+Scans the specified repository's default branch and open pull-request branches, then classifies the latest run per workflow for each exact head SHA. Failed job logs are downloaded as GitHub ZIP archives, decoded, and truncated to a bounded tail. In wildcard mode (`ALLOWED_REPOS="*"`), the `?repo=owner/repo` query parameter is required to keep subrequests within Cloudflare limits.
 
 ```bash
 curl -sS -H "Authorization: Bearer $CAPABILITY_SECRET" \

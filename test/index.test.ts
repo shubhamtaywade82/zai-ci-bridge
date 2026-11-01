@@ -9,7 +9,13 @@ import worker, {
   normalizeFixBranch,
   parseAllowedRepos,
   validateFixFiles
-} from "../src/index.js";
+} from "../src/index.ts";
+
+function getRequestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  return (input as Request).url;
+}
 
 test("parseAllowedRepos trims entries and removes duplicates", () => {
   assert.deepEqual(parseAllowedRepos(" acme/api,acme/web, acme/api "), ["acme/api", "acme/web"]);
@@ -101,10 +107,10 @@ test("loadConfig accepts wildcard ALLOWED_REPOS", () => {
 
 test("discoverAccessibleRepos paginates and filters archived or disabled repos", async () => {
   const originalFetch = globalThis.fetch;
-  const calls = [];
-  globalThis.fetch = async (url, options) => {
-    calls.push({ url, options });
-    const urlObj = new URL(url);
+  const calls: unknown[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    calls.push({ input, init });
+    const urlObj = new URL(getRequestUrl(input));
     const page = urlObj.searchParams.get("page");
     if (page === "1") {
       return new Response(JSON.stringify([
@@ -115,7 +121,7 @@ test("discoverAccessibleRepos paginates and filters archived or disabled repos",
       ]), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     return new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
-  };
+  }) as typeof fetch;
 
   try {
     const repos = await discoverAccessibleRepos({ Authorization: "Bearer token" }, 10);
@@ -128,8 +134,8 @@ test("discoverAccessibleRepos paginates and filters archived or disabled repos",
 
 test("discoverAccessibleRepos handles multiple pages until limit is reached", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
-    const page = new URL(url).searchParams.get("page");
+  globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    const page = new URL(getRequestUrl(input)).searchParams.get("page");
     if (page === "1") {
       return new Response(JSON.stringify([{ full_name: "acme/repo-1", archived: false, disabled: false }]), {
         status: 200,
@@ -140,7 +146,7 @@ test("discoverAccessibleRepos handles multiple pages until limit is reached", as
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
-  };
+  }) as typeof fetch;
 
   try {
     const repos = await discoverAccessibleRepos({ Authorization: "Bearer token" }, 2, 1);
@@ -152,8 +158,10 @@ test("discoverAccessibleRepos handles multiple pages until limit is reached", as
 
 test("Worker healthCheck enumerates discovered repos under wildcard mode", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
-    const parsed = new URL(url);
+  const calls: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    const parsed = new URL(getRequestUrl(input));
+    calls.push(parsed.pathname);
     if (parsed.pathname === "/user") {
       return new Response(JSON.stringify({ login: "bot-user" }), { status: 200 });
     }
@@ -164,6 +172,46 @@ test("Worker healthCheck enumerates discovered repos under wildcard mode", async
       return new Response(JSON.stringify([{ full_name: "acme/api", archived: false, disabled: false }]), {
         status: 200
       });
+    }
+    return new Response("Not found", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const response = await worker.fetch(new Request("https://bridge.example/health", {
+      headers: { Authorization: "Bearer test-secret" }
+    }), {
+      GITHUB_TOKEN: "token",
+      CAPABILITY_SECRET: "test-secret",
+      ALLOWED_REPOS: "*"
+    });
+
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      status: string;
+      allowedRepos: string;
+      discoveredRepos: string[];
+      repositoryAccess: Array<{ repo: string }>;
+    };
+    assert.equal(body.status, "ok");
+    assert.equal(body.allowedRepos, "*");
+    assert.deepEqual(body.discoveredRepos, ["acme/api"]);
+    assert.equal(body.repositoryAccess.length, 1);
+    assert.equal(body.repositoryAccess[0].repo, "acme/api");
+    assert.equal(calls.length, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Worker healthCheck supports deep check for single repo with ?repo=...", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    const parsed = new URL(getRequestUrl(input));
+    if (parsed.pathname === "/user") {
+      return new Response(JSON.stringify({ login: "bot-user" }), { status: 200 });
+    }
+    if (parsed.pathname === "/rate_limit") {
+      return new Response(JSON.stringify({ rate: { remaining: 4999 } }), { status: 200 });
     }
     if (parsed.pathname === "/repos/acme/api") {
       return new Response(JSON.stringify({ default_branch: "main", permissions: { push: true } }), { status: 200 });
@@ -178,10 +226,10 @@ test("Worker healthCheck enumerates discovered repos under wildcard mode", async
       return new Response(JSON.stringify([]), { status: 200 });
     }
     return new Response("Not found", { status: 404 });
-  };
+  }) as typeof fetch;
 
   try {
-    const response = await worker.fetch(new Request("https://bridge.example/health", {
+    const response = await worker.fetch(new Request("https://bridge.example/health?repo=acme/api", {
       headers: { Authorization: "Bearer test-secret" }
     }), {
       GITHUB_TOKEN: "token",
@@ -190,21 +238,31 @@ test("Worker healthCheck enumerates discovered repos under wildcard mode", async
     });
 
     assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.status, "ok");
-    assert.equal(body.allowedRepos, "*");
-    assert.deepEqual(body.discoveredRepos, ["acme/api"]);
+    const body = (await response.json()) as { repositoryAccess: Array<{ repo: string; contentsRead: string }> };
     assert.equal(body.repositoryAccess.length, 1);
-    assert.equal(body.repositoryAccess[0].repo, "acme/api");
+    assert.equal(body.repositoryAccess[0].contentsRead, "ok");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
+test("Worker diagnostics in wildcard mode rejects unparameterized call to prevent subrequest limits", async () => {
+  const response = await worker.fetch(new Request("https://bridge.example/diagnostics", {
+    headers: { Authorization: "Bearer test-secret" }
+  }), {
+    GITHUB_TOKEN: "token",
+    CAPABILITY_SECRET: "test-secret",
+    ALLOWED_REPOS: "*"
+  });
+  assert.equal(response.status, 400);
+  const body = (await response.json()) as { error: string };
+  assert.match(body.error, /In wildcard mode, specify \?repo=owner\/repo/);
+});
+
 test("Worker diagnostics in wildcard mode handles requested repo", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
-    const parsed = new URL(url);
+  globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    const parsed = new URL(getRequestUrl(input));
     if (parsed.pathname === "/repos/acme/api") {
       return new Response(JSON.stringify({ default_branch: "main" }), { status: 200 });
     }
@@ -218,7 +276,7 @@ test("Worker diagnostics in wildcard mode handles requested repo", async () => {
       return new Response(JSON.stringify({ workflow_runs: [] }), { status: 200 });
     }
     return new Response("Not found", { status: 404 });
-  };
+  }) as typeof fetch;
 
   try {
     const response = await worker.fetch(new Request("https://bridge.example/diagnostics?repo=acme/api", {
@@ -230,7 +288,7 @@ test("Worker diagnostics in wildcard mode handles requested repo", async () => {
     });
 
     assert.equal(response.status, 200);
-    const body = await response.json();
+    const body = (await response.json()) as { reports: Array<{ repo: string }> };
     assert.equal(body.reports.length, 1);
     assert.equal(body.reports[0].repo, "acme/api");
   } finally {

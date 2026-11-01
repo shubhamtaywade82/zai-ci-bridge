@@ -9,10 +9,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --test",
-    "check": "node --check src/index.js && node --test"
+    "test": "node --experimental-strip-types --test",
+    "check": "tsc --noEmit && node --experimental-strip-types --test"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261101.1",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
     "wrangler": "4.156.0"
   }
 }
