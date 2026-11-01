@@ -53,22 +53,7 @@ export default {
       }
 
       if (request.method === "GET" && route.action === "diagnostics") {
-        const requestedRepo = url.searchParams.get("repo");
-        if (requestedRepo && !config.allowedRepos.includes(requestedRepo)) {
-          throw new HttpError(400, "Repository not in ALLOWED_REPOS");
-        }
-
-        const repos = requestedRepo ? [requestedRepo] : config.allowedRepos;
-        if (repos.length === 0) {
-          throw new HttpError(400, "ALLOWED_REPOS is empty; configure at least one repository");
-        }
-
-        const reports = [];
-        for (const repo of repos) {
-          reports.push(await inspectRepository(repo, ghHeaders, config));
-        }
-
-        return jsonResponse({ timestamp: new Date().toISOString(), reports });
+        return await handleDiagnostics(url, config, ghHeaders);
       }
 
       if (request.method === "POST" && route.action === "apply-fix") {
@@ -104,16 +89,36 @@ export function loadConfig(env) {
   return { allowedRepos, prTargetMode, maxBotCommits, maxTargets };
 }
 
+export function isValidRepoName(repo) {
+  if (typeof repo !== "string") return false;
+  const [owner, name] = repo.split("/");
+  return (
+    Boolean(owner) &&
+    Boolean(name) &&
+    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) &&
+    owner !== "." &&
+    owner !== ".." &&
+    name !== "." &&
+    name !== ".."
+  );
+}
+
 export function parseAllowedRepos(value) {
-  const repos = [...new Set(String(value).split(",").map(item => item.trim()).filter(Boolean))];
+  const normalized = String(value).trim();
+  if (normalized === "*") return "*";
+
+  const repos = [...new Set(normalized.split(",").map(item => item.trim()).filter(Boolean))];
   for (const repo of repos) {
-    const [owner, name] = repo.split("/");
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ||
-        owner === "." || owner === ".." || name === "." || name === "..") {
+    if (!isValidRepoName(repo)) {
       throw new Error(`Invalid repository name: ${repo}`);
     }
   }
   return repos;
+}
+
+export function isRepoAllowed(repo, allowedRepos) {
+  if (!isValidRepoName(repo)) return false;
+  return allowedRepos === "*" || (Array.isArray(allowedRepos) && allowedRepos.includes(repo));
 }
 
 export function validateFixFiles(files) {
@@ -362,42 +367,62 @@ async function readRequestText(request, maxBytes) {
   return new TextDecoder().decode(bytes);
 }
 
-async function healthCheck(config, headers) {
-  let user;
-  let rateLimit;
-  try {
-    [user, rateLimit] = await Promise.all([
-      ghFetch(`${GITHUB_API}/user`, headers),
-      ghFetch(`${GITHUB_API}/rate_limit`, headers)
-    ]);
-  } catch (error) {
-    throw new HttpError(502, `GitHub authentication check failed: ${safeErrorMessage(error)}`);
+async function handleDiagnostics(url, config, ghHeaders) {
+  const requestedRepo = url.searchParams.get("repo");
+  if (requestedRepo && !isRepoAllowed(requestedRepo, config.allowedRepos)) {
+    throw new HttpError(400, "Repository not in ALLOWED_REPOS");
   }
 
-  const repositoryReports = [];
-  for (const repo of config.allowedRepos) {
-    const encoded = encodeRepo(repo);
-    try {
-      const metadata = await ghFetch(`${GITHUB_API}/repos/${encoded}`, headers);
-      const [contents, actions, pullRequests] = await Promise.all([
-        ghFetch(`${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(metadata.default_branch)}`, headers),
-        ghFetch(`${GITHUB_API}/repos/${encoded}/actions/runs?per_page=1`, headers),
-        ghFetch(`${GITHUB_API}/repos/${encoded}/pulls?state=open&per_page=1`, headers)
-      ]);
-      repositoryReports.push({
-        repo,
-        status: "ok",
-        contentsRead: contents.object?.sha ? "ok" : "unknown",
-        actionsRead: "ok",
-        pullRequestsRead: "ok",
-        accountPushPermission: metadata.permissions?.push ?? null,
-        defaultBranch: metadata.default_branch,
-        workflowRunsVisible: actions.total_count ?? null,
-        openPullRequestsVisible: Array.isArray(pullRequests) ? pullRequests.length : null
-      });
-    } catch (error) {
-      repositoryReports.push({ repo, status: "error", error: safeErrorMessage(error) });
+  const repos = requestedRepo
+    ? [requestedRepo]
+    : (config.allowedRepos === "*"
+        ? await discoverAccessibleRepos(ghHeaders)
+        : config.allowedRepos);
+
+  if (repos.length === 0) {
+    throw new HttpError(400, config.allowedRepos === "*"
+      ? "No accessible repositories found for GitHub token"
+      : "ALLOWED_REPOS is empty; configure at least one repository");
+  }
+
+  const reports = [];
+  for (const repo of repos) {
+    reports.push(await inspectRepository(repo, ghHeaders, config));
+  }
+
+  return jsonResponse({ timestamp: new Date().toISOString(), reports });
+}
+
+export async function discoverAccessibleRepos(headers, maxRepos = 100, pageSize = Math.min(100, maxRepos)) {
+  const repos = [];
+  let page = 1;
+  while (repos.length < maxRepos) {
+    const data = await ghFetch(
+      `${GITHUB_API}/user/repos?per_page=${pageSize}&page=${page}&sort=updated`,
+      headers
+    );
+    if (!Array.isArray(data) || data.length === 0) break;
+    for (const item of data) {
+      if (item.full_name && !item.archived && !item.disabled) {
+        repos.push(item.full_name);
+        if (repos.length >= maxRepos) break;
+      }
     }
+    if (data.length < pageSize) break;
+    page += 1;
+  }
+  return repos;
+}
+
+async function healthCheck(config, headers) {
+  const [user, rateLimit] = await fetchGitHubIdentity(headers);
+  const targetRepos = config.allowedRepos === "*"
+    ? await discoverAccessibleRepos(headers)
+    : config.allowedRepos;
+
+  const repositoryReports = [];
+  for (const repo of targetRepos) {
+    repositoryReports.push(await checkRepositoryAccess(repo, headers));
   }
 
   const repositoriesHealthy = repositoryReports.every(report => report.status === "ok");
@@ -406,14 +431,59 @@ async function healthCheck(config, headers) {
     githubAuthentication: "ok",
     githubUser: user.login,
     allowedRepos: config.allowedRepos,
+    discoveredRepos: config.allowedRepos === "*" ? targetRepos : undefined,
     repositoryAccess: repositoryReports,
     prTargetMode: config.prTargetMode,
     maxBotCommitsPerBranch: config.maxBotCommits,
     githubRateLimitRemaining: rateLimit.rate?.remaining ?? null,
-    warning: config.allowedRepos.length === 0
-      ? "ALLOWED_REPOS is empty; diagnostics and apply-fix are disabled until it is configured."
-      : "Push permission is reported for the linked GitHub user; GitHub does not expose fine-grained token write grants through this read-only health check."
+    warning: healthCheckWarning(config.allowedRepos, targetRepos)
   }, repositoriesHealthy ? 200 : 207);
+}
+
+async function fetchGitHubIdentity(headers) {
+  try {
+    return await Promise.all([
+      ghFetch(`${GITHUB_API}/user`, headers),
+      ghFetch(`${GITHUB_API}/rate_limit`, headers)
+    ]);
+  } catch (error) {
+    throw new HttpError(502, `GitHub authentication check failed: ${safeErrorMessage(error)}`);
+  }
+}
+
+function healthCheckWarning(allowedRepos, targetRepos) {
+  if (allowedRepos !== "*" && allowedRepos.length === 0) {
+    return "ALLOWED_REPOS is empty; diagnostics and apply-fix are disabled until it is configured.";
+  }
+  if (allowedRepos === "*" && targetRepos.length === 0) {
+    return "No accessible repositories found for the GitHub token.";
+  }
+  return "Push permission is reported for the linked GitHub user; GitHub does not expose fine-grained token write grants through this read-only health check.";
+}
+
+async function checkRepositoryAccess(repo, headers) {
+  const encoded = encodeRepo(repo);
+  try {
+    const metadata = await ghFetch(`${GITHUB_API}/repos/${encoded}`, headers);
+    const [contents, actions, pullRequests] = await Promise.all([
+      ghFetch(`${GITHUB_API}/repos/${encoded}/git/ref/heads/${encodeURIComponent(metadata.default_branch)}`, headers),
+      ghFetch(`${GITHUB_API}/repos/${encoded}/actions/runs?per_page=1`, headers),
+      ghFetch(`${GITHUB_API}/repos/${encoded}/pulls?state=open&per_page=1`, headers)
+    ]);
+    return {
+      repo,
+      status: "ok",
+      contentsRead: contents.object?.sha ? "ok" : "unknown",
+      actionsRead: "ok",
+      pullRequestsRead: "ok",
+      accountPushPermission: metadata.permissions?.push ?? null,
+      defaultBranch: metadata.default_branch,
+      workflowRunsVisible: actions.total_count ?? null,
+      openPullRequestsVisible: Array.isArray(pullRequests) ? pullRequests.length : null
+    };
+  } catch (error) {
+    return { repo, status: "error", error: safeErrorMessage(error) };
+  }
 }
 
 async function inspectRepository(repo, headers, config) {
@@ -521,6 +591,7 @@ async function inspectRepository(repo, headers, config) {
 }
 
 async function fetchJobLogTail(repo, jobId, headers) {
+  const encoded = encodeRepo(repo);
   try {
     const response = await fetch(`${GITHUB_API}/repos/${encoded}/actions/jobs/${jobId}/logs`, {
       headers,
@@ -571,7 +642,7 @@ async function applyFix(body, config, headers) {
     throw new HttpError(400, "Request body must be a JSON object");
   }
   const { repo, sourceBranch, originalBaseBranch, commitMessage } = body;
-  if (typeof repo !== "string" || !config.allowedRepos.includes(repo)) {
+  if (!isRepoAllowed(repo, config.allowedRepos)) {
     throw new HttpError(400, "Repository not in ALLOWED_REPOS");
   }
   if (typeof sourceBranch !== "string" || sourceBranch.length === 0) {

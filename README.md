@@ -19,7 +19,7 @@ zai-ci-bridge/
 
 ## Configuration
 
-Edit `ALLOWED_REPOS` in `wrangler.toml` with a comma-separated allowlist of repositories in `owner/name` form. It is intentionally empty in the initial commit; no repository is enabled until you select it.
+Set `ALLOWED_REPOS` in `wrangler.toml` either to `"*"` for automatic discovery of all repositories accessible by `GITHUB_TOKEN`, or to a comma-separated allowlist of repositories in `owner/name` form.
 
 `NON_DEFAULT_PR_TARGET_MODE` controls the base of newly opened autofix pull requests:
 
@@ -115,7 +115,7 @@ Deletion example: `{ "path": "src/obsolete.js", "deleted": true }`.
 
 ## Operational and security boundaries
 
-- The allowlist is checked on every request; a caller cannot target an arbitrary repository.
+- Repository authorization is checked on every request. When `ALLOWED_REPOS="*"` is configured, accessible active repositories are discovered through GitHub's API, and the repository scope granted to the `GITHUB_TOKEN` serves as the outer security boundary. When an explicit list is configured, requests targeting other repositories are blocked immediately.
 - GitHub Actions logs and failure details are returned only to an authenticated caller. Treat diagnostic responses as sensitive.
 - `.github/**` is blocked so an agent cannot silently alter CI workflows or repository automation through this bridge.
 - Branch updates are non-force pushes. Concurrent/stale writes fail rather than rewriting branch history.
