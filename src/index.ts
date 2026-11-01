@@ -690,9 +690,12 @@ async function inspectRepository(repo: string, headers: Record<string, string>, 
 
     actionableFailures.push({
       ...target,
+      runId: primaryFailedRun.id,
+      workflowName: primaryFailedRun.name || primaryFailedRun.display_title || "unknown",
       failedWorkflowName: primaryFailedRun.name || primaryFailedRun.display_title || "unknown",
       failedJobName: failedJob?.name || "unknown",
       failedSteps: failedJob?.steps?.filter(step => step.conclusion === "failure").map(step => step.name) || [],
+      existingAutofixPR: existingAutofixPR || null,
       runUrl: primaryFailedRun.html_url,
       logTail
     });
@@ -814,10 +817,16 @@ async function applyFix(body: Record<string, unknown>, config: AppConfig, header
   let prBase: string | null = existingPRs[0]?.base?.ref || null;
 
   if (!prUrl) {
+    const explicitBase = (typeof body.baseBranchForPR === "string" && body.baseBranchForPR)
+      || (typeof originalBaseBranch === "string" && originalBaseBranch)
+      || null;
+
     if (sourceBranch === defaultBranch) {
       prBase = defaultBranch;
+    } else if (explicitBase) {
+      prBase = explicitBase;
     } else if (config.prTargetMode === "original_base") {
-      prBase = (typeof originalBaseBranch === "string" && originalBaseBranch) ? originalBaseBranch : defaultBranch;
+      prBase = defaultBranch;
     } else {
       prBase = sourceBranch;
     }
